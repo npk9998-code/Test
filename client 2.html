@@ -9,7 +9,6 @@
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;800;900&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 <style>
 :root{
   --gold:#f59e0b; --gold-d:#d97706;
@@ -250,7 +249,6 @@ textarea.inp{resize:vertical}
       <textarea id="c_notes" class="inp" rows="3" placeholder="مثال: قريب من مسجد، دفع كاش، شارع معين..."></textarea>
     </div>
 
-    <div class="cf-turnstile" data-sitekey="0x4AAAAAADvjrIOXhfmpiUt_" data-callback="onTurnstileSuccess" data-expired-callback="onTurnstileExpired" style="margin-bottom:10px;display:flex;justify-content:center"></div>
     <button class="submit-btn" id="submitBtn" onclick="submitForm()">📤 إرسال الطلب</button>
     <div class="form-note">🔒 بياناتك آمنة ولن تُشارك مع أي طرف ثالث<br>سيتم مراجعة طلبك والتواصل معك قريباً</div>
   </div>
@@ -281,26 +279,19 @@ const SUPABASE_URL = 'https://jqirtyjhkfivufleteek.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpxaXJ0eWpoa2ZpdnVmbGV0ZWVrIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODIwNzUzMDUsImV4cCI6MjA5NzY1MTMwNX0.SK1xJ0Yd3aY6iBjhDAqWn0KUVStMBwQBaNSJmWdMpWQ';
 const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// Submissions go through this Edge Function, which verifies the Turnstile token
-// server-side (with the secret key) and only then inserts the row.
-const SUBMIT_ENDPOINT = SUPABASE_URL + '/functions/v1/verify-submit';
+// ── Incoming link parameters (?phone=9665XXXXXXXX&role=seller|buyer) ──
+// phone: optional. If present, it's the WhatsApp conversation number the
+//        customer arrived from; the phone field is left empty so the customer
+//        can type any number, and this raw value is stored separately as
+//        whatsapp_phone (the confirmation message is sent to it).
+// role:  optional. If it's exactly 'seller' or 'buyer' we preselect that tab;
+//        the buttons stay fully interactive either way.
+const urlParams = new URLSearchParams(window.location.search);
+const whatsappPhone = urlParams.get('phone') || '';
+const initialRole = urlParams.get('role') || '';
 
 let selDir='', selType='', selPay='', negotiable=false, clientType='seller';
 let toastT=null;
-let turnstileToken=null;
-
-function onTurnstileSuccess(token){ turnstileToken=token; }
-function onTurnstileExpired(){ turnstileToken=null; }
-
-// Basic per-device cooldown to slow down accidental/rapid resubmission.
-// This is a UX-level guard, not a security boundary — Turnstile + the Edge
-// Function are what actually stop abuse.
-const SUBMIT_COOLDOWN_MS = 2*60*1000; // 2 minutes
-function getRemainingCooldown(){
-  const last=Number(localStorage.getItem('wasl_last_submit')||0);
-  const remaining=SUBMIT_COOLDOWN_MS-(Date.now()-last);
-  return remaining>0?remaining:0;
-}
 
 function init(){
   // Build direction buttons
@@ -321,6 +312,11 @@ function init(){
     const el=document.getElementById(id);
     if(el) el.addEventListener('input', onMoneyInput);
   });
+
+  // Apply incoming link parameters, if any
+  if(initialRole==='seller' || initialRole==='buyer'){
+    setClientType(initialRole);
+  }
 }
 
 // Convert Arabic-Indic / Persian digits to standard English digits
@@ -437,16 +433,6 @@ async function submitForm(){
   if(!name){ toast('⚠️ الرجاء إدخال الاسم','warn'); return; }
   if(!phone){ toast('⚠️ الرجاء إدخال رقم الجوال','warn'); return; }
 
-  const cooldown=getRemainingCooldown();
-  if(cooldown>0){
-    toast('⏳ الرجاء الانتظار '+Math.ceil(cooldown/1000)+' ثانية قبل إرسال طلب آخر','warn');
-    return;
-  }
-  if(!turnstileToken){
-    toast('⚠️ الرجاء إكمال التحقق الأمني أعلاه','warn');
-    return;
-  }
-
   const btn=document.getElementById('submitBtn');
   btn.disabled=true; btn.textContent='⏳ جاري الإرسال...';
 
@@ -454,6 +440,7 @@ async function submitForm(){
   const entry={
     id: gid(),
     clientType: clientType,   // 'seller' | 'buyer'
+    whatsappPhone: whatsappPhone, // from ?phone= on the incoming link, '' if opened elsewhere
     city: city,
     direction: selDir,
     neighborhood: document.getElementById('c_neighborhood').value.trim(),
@@ -482,6 +469,7 @@ async function submitForm(){
   const row={
     id: entry.id,
     client_type: entry.clientType,
+    whatsapp_phone: entry.whatsappPhone || null,
     status: 'pending',
     source: 'inbox',
     city: entry.city || null,
@@ -506,32 +494,61 @@ async function submitForm(){
   };
 
   try{
-    const res = await fetch(SUBMIT_ENDPOINT, {
-      method:'POST',
-      headers:{
-        'Content-Type':'application/json',
-        'apikey': SUPABASE_KEY,
-        'Authorization':'Bearer '+SUPABASE_KEY,
-      },
-      body: JSON.stringify({ row, token: turnstileToken }),
-    });
-    const data = await res.json().catch(()=>({}));
-    if(!res.ok || data.error) throw new Error(data.error || ('HTTP '+res.status));
-    localStorage.setItem('wasl_last_submit', String(Date.now()));
+    console.log('submitForm: sending row →', row);
+
+    // Race the insert against a timeout — without this, a stalled/blocked
+    // network request (ad-blocker, VPN, flaky connection) leaves the button
+    // stuck on "جاري الإرسال..." forever with no error and no way to retry.
+    const insertPromise = sb.from('listings').insert(row);
+    const timeoutPromise = new Promise((_, reject)=>
+      setTimeout(()=>reject(new Error('TIMEOUT: لم يصل رد من الخادم خلال 15 ثانية')), 15000)
+    );
+    let { error } = await Promise.race([insertPromise, timeoutPromise]);
+    console.log('submitForm: insert result →', error || 'OK');
+
+    // Self-healing fallback: if the DB doesn't have the whatsapp_phone column
+    // yet (migration not run), retry once without it instead of failing the
+    // whole submission. Once the column is added, this branch simply won't
+    // trigger anymore.
+    if(error && /column .* does not exist|could not find/i.test(error.message||'')){
+      const rowWithoutPhone = Object.assign({}, row);
+      delete rowWithoutPhone.whatsapp_phone;
+      const retryPromise = sb.from('listings').insert(rowWithoutPhone);
+      const retry = await Promise.race([retryPromise, timeoutPromise]);
+      error = retry.error;
+    }
+
+    if(error) throw error;
     showSuccess();
   }catch(err){
+    // Log the full Supabase error object (code, message, details, hint) — this
+    // is what actually tells you *why* an insert failed. Check the browser
+    // console (F12) when troubleshooting a "won't submit" report.
     console.error('Submit error:', err);
     let msg='❌ حدث خطأ في الإرسال، تحقق من الاتصال';
-    const errStr=String(err && err.message ? err.message : err);
-    if(errStr.includes('403')) msg='❌ خطأ في صلاحية الوصول (403) — راسل مدير النظام';
-    else if(errStr.includes('404')) msg='❌ لم يتم العثور على قاعدة البيانات (404)';
-    else if(errStr.includes('429')) msg='❌ تم تجاوز الحد المسموح من الطلبات، حاول لاحقاً';
-    else if(errStr.includes('التحقق')) msg='❌ '+errStr;
+    const code   = err && err.code ? String(err.code) : '';
+    const errStr = String(err && err.message ? err.message : err);
+
+    if(code==='42501' || /row-level security|permission denied/i.test(errStr)){
+      // Most common cause: the anon role has no INSERT policy on `listings`.
+      msg='❌ الصلاحيات (RLS) تمنع الإرسال — راجع سياسة الإدراج على جدول listings';
+    } else if(errStr.startsWith('TIMEOUT')){
+      msg='⏱️ لم يصل رد من الخادم — تحقق من الاتصال بالإنترنت أو أوقف مانع الإعلانات وحاول مجدداً';
+    } else if(/column .* does not exist|could not find/i.test(errStr)){
+      // Payload includes a field the table doesn't have yet (e.g. whatsapp_phone).
+      msg='❌ عمود غير موجود في قاعدة البيانات — راجع مخطط الجدول';
+    } else if(errStr.includes('403')){
+      msg='❌ خطأ في صلاحية الوصول (403) — راسل مدير النظام';
+    } else if(errStr.includes('404')){
+      msg='❌ لم يتم العثور على قاعدة البيانات (404)';
+    } else if(errStr.includes('429')){
+      msg='❌ تم تجاوز الحد المسموح من الطلبات، حاول لاحقاً';
+    } else if(errStr && errStr!=='[object Object]'){
+      msg='❌ '+errStr;
+    }
     toast(msg,'err');
     btn.disabled=false;
     btn.textContent=isBuyer?'📤 إرسال طلب الشراء':'📤 إرسال عرض البيع';
-    if(typeof turnstile!=='undefined') turnstile.reset();
-    turnstileToken=null;
   }
 }
 
@@ -552,7 +569,7 @@ function resetForm(){
     const el=document.getElementById(id); if(el) el.value=id==='c_city'?'الرياض':'';
   });
   document.getElementById('submitBtn').disabled=false;
-  setClientType('seller');
+  setClientType(initialRole==='buyer' ? 'buyer' : 'seller');
   DIRS.forEach(d=>{
     const btn=document.getElementById('dir_'+d); const c=DC[d];
     if(btn){ btn.className='dbtn'; btn.style.borderColor=c.badge+'20'; btn.style.background='rgba(255,255,255,.03)'; btn.style.color='#94a3b8'; }
